@@ -10,7 +10,58 @@ const { nprofileEncode } = nip19
 const { v2 } = nip44
 const { encrypt: encryptV2, decrypt: decryptV2, utils } = v2
 const { getConversationKey: getConversationKeyV2 } = utils
-const handledEvents: string[] = [] // TODO: - big memory leak here, add TTL
+
+// Replace the unbounded array with a time-based Map
+interface EventCacheEntry {
+  timestamp: number;
+}
+
+// Event cache with TTL (default 1 hour)
+class EventCache {
+  private cache = new Map<string, EventCacheEntry>();
+  private ttlMs: number;
+  private cleanupInterval: NodeJS.Timer;
+  private log = getLogger({ component: "eventCache" });
+  
+  constructor(ttlMs = 60 * 60 * 1000) { // Default TTL: 1 hour
+    this.ttlMs = ttlMs;
+    // Run cleanup every 15 minutes
+    this.cleanupInterval = setInterval(() => this.cleanup(), 15 * 60 * 1000);
+  }
+  
+  add(eventId: string): void {
+    this.cache.set(eventId, { timestamp: Date.now() });
+  }
+  
+  has(eventId: string): boolean {
+    return this.cache.has(eventId);
+  }
+  
+  cleanup(): void {
+    const now = Date.now();
+    let expiredCount = 0;
+    
+    for (const [eventId, entry] of this.cache.entries()) {
+      if (now - entry.timestamp > this.ttlMs) {
+        this.cache.delete(eventId);
+        expiredCount++;
+      }
+    }
+    
+    if (expiredCount > 0) {
+      this.log(`Cleaned up ${expiredCount} expired events, current cache size: ${this.cache.size}`);
+    }
+  }
+  
+  // For proper cleanup when the process ends
+  stop(): void {
+    clearInterval(this.cleanupInterval);
+  }
+}
+
+// Create the event cache instance
+const handledEventsCache = new EventCache();
+
 type AppInfo = { appId: string, publicKey: string, privateKey: string, name: string }
 type ClientInfo = { clientId: string, publicKey: string, privateKey: string, name: string }
 export type SendData = { type: "content", content: string, pub: string } | { type: "event", event: UnsignedEvent, encrypt?: { toPub: string } }
@@ -170,11 +221,11 @@ export default class Handler {
 
     async processEvent(e: Event, app: AppInfo) {
         const eventId = e.id
-        if (handledEvents.includes(eventId)) {
+        if (handledEventsCache.has(eventId)) {
             this.log("event already handled")
             return
         }
-        handledEvents.push(eventId)
+        handledEventsCache.add(eventId)
         const startAtMs = Date.now()
         const startAtNano = process.hrtime.bigint().toString()
         let content = ""
@@ -187,7 +238,6 @@ export default class Handler {
         } catch (e: any) {
             this.log(ERROR, "failed to decrypt event", e.message, e.content)
             return
-
         }
         this.eventCallback({ id: eventId, content, pub: e.pubkey, appId: app.appId, startAtNano, startAtMs, kind: e.kind })
     }
@@ -262,3 +312,19 @@ export default class Handler {
         throw new Error("unkown initiator type")
     }
 }
+
+// Make sure we clean up when the process exits
+process.on('SIGINT', () => {
+    handledEventsCache.stop();
+    process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+    handledEventsCache.stop();
+    process.exit(0);
+});
+
+// Add explicit handler for process exit
+process.on("exit", () => {
+    handledEventsCache.stop();
+});
